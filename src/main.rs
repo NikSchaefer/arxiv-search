@@ -4,6 +4,7 @@ use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Result;
 use std::fs;
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ struct Paper {
 }
 
 const API_HOME_URL: &str = "https://arxiv.org/pdf/";
+const MODEL_SAVE_FILE: &str = "weights/model_indexes.bin";
 
 fn remove_punctuation(input: &str) -> String {
     input
@@ -63,16 +65,15 @@ fn tokenize(input: &str) -> Vec<String> {
         .collect()
 }
 
-fn main() {
-    // Add total runtime tracker
-    let total_runtime = Instant::now();
+// Create a structure to hold both maps
+#[derive(Serialize, Deserialize)]
+struct IndexModel {
+    word_map: HashMap<String, HashSet<String>>,
+    paper_map: HashMap<String, Paper>,
+    total_paper_count: usize,
+}
 
-    // This leds us configure the concurrency framework to fit with our CPU
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(11)
-        .build_global()
-        .unwrap();
-
+fn create_model() -> IndexModel {
     println!("Loading and parsing data...");
 
     // First, load the data from the dataset and parse into a vector
@@ -126,11 +127,55 @@ fn main() {
         .map(|paper| (paper.id.clone(), paper.clone()))
         .collect();
 
-    println!("Processing and indexing papers...");
+    let word_paper_map_serial: HashMap<String, HashSet<String>> = word_paper_map
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+
+    return IndexModel {
+        word_map: word_paper_map_serial,
+        paper_map: paper_id_map,
+        total_paper_count,
+    };
+}
+
+fn save_model(model: &IndexModel) -> Result {
+    let file = fs::File::create(MODEL_SAVE_FILE).expect("Failed to create file");
+
+    bincode::serialize_into(&file, &model).expect("Failed to encode model");
+    Ok(())
+}
+
+fn load_model() -> IndexModel {
+    let file = fs::File::open(MODEL_SAVE_FILE).expect("Failed to open save file");
+
+    bincode::deserialize_from(&file).expect("Failed to parse model")
+}
+
+fn main() {
+    let load_from_model = true;
+
+    // Add total runtime tracker
+    let total_runtime = Instant::now();
+
+    // This leds us configure the concurrency framework to fit with our CPU
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(11)
+        .build_global()
+        .unwrap();
+
+    println!("Setting up model");
+
+    let model = match load_from_model {
+        true => load_model(),
+        false => {
+            let model = create_model();
+            save_model(&model).expect("Failed to save model");
+            model
+        }
+    };
 
     println!("Ready for queries after: {:.2?}", total_runtime.elapsed());
-
-    // save model indexes
 
     // This is where we begin with our word dependent ranking
     let query: &str = "Dark Matter";
@@ -145,7 +190,7 @@ fn main() {
 
     // iterate through each word in our search query, calculate TF-IDF for each and add to scores
     for word in tokenized_query {
-        let ids = match word_paper_map.get(&word) {
+        let ids = match model.word_map.get(&word) {
             Some(ids) => ids,
             None => {
                 println!("Unrecognized word");
@@ -159,11 +204,11 @@ fn main() {
         // calculate the inverse document frequency
         // this does not chance on a per word basis, so we can calculate it earlier
         let inverse_doc_frequency: f64 =
-            (total_paper_count as f64 / (1 + paper_with_word_count) as f64).ln();
+            (model.total_paper_count as f64 / (1 + paper_with_word_count) as f64).ln();
 
         // here we iterate over each paper, for each word, adding the TF-IDF score
         for paper_id in ids.iter() {
-            let paper = match paper_id_map.get(paper_id) {
+            let paper = match model.paper_map.get(paper_id) {
                 Some(paper) => paper,
                 None => continue,
             };
@@ -191,7 +236,7 @@ fn main() {
     println!("\nQuery Results (took {:.2?}):", query_runtime.elapsed());
 
     for (paper_id, score) in score_vec.iter().take(5) {
-        if let Some(paper) = paper_id_map.get(paper_id) {
+        if let Some(paper) = model.paper_map.get(paper_id) {
             let paper_link = API_HOME_URL.to_owned() + paper_id;
             println!(
                 "Score: {:.4}, Title: {}, Link: {}",

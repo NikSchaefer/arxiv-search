@@ -5,7 +5,7 @@ import json
 
 papers = []
 
-line_cutoff = 100_000
+line_cutoff = 100_000_000
 
 with open("dataset.json", "r") as file:
     for line in file:
